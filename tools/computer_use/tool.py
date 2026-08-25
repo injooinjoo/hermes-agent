@@ -91,6 +91,18 @@ _DESTRUCTIVE_ACTIONS = frozenset({
     "cua_browser_set_input_files", "cua_browser_download",
 })
 
+# A batch is deliberately narrower than the public action surface. It is for
+# deterministic execution of a plan the parent model already made, not for
+# hiding high-impact browser setup, native dialogs, file transfer, or another
+# nested control loop inside a cheap executor.
+_MAX_BATCH_STEPS = 12
+_BATCH_ALLOWED_ACTIONS = frozenset({
+    "click", "double_click", "drag", "scroll", "type", "key", "set_value",
+    "wait", "list_apps", "list_windows", "focus_app", "cua_browser_state",
+    "cua_browser_navigate", "cua_browser_click", "cua_browser_type",
+    "cua_browser_pointer",
+})
+
 # Hard-blocked key combinations. Mirrored from #4562 — these are destructive
 # regardless of approval level (e.g. logout kills the session Hermes runs in).
 _BLOCKED_KEY_COMBOS = {
@@ -543,6 +555,160 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
 # Dispatch
 # ---------------------------------------------------------------------------
 
+def _action_validation_error(action: str, args: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return a fail-closed validation payload without performing side effects."""
+    if not action:
+        return {"error": "missing `action`"}
+
+    if action in {"type", "cua_browser_type"}:
+        text = args.get("text", "")
+        if not isinstance(text, str):
+            return {"error": "type text must be a string"}
+        pat = _is_blocked_type(text)
+        if pat:
+            return {
+                "error": f"blocked pattern in type text: {pat!r}",
+                "hint": "Dangerous shell patterns cannot be typed via computer_use.",
+            }
+
+    if action == "key":
+        keys = args.get("keys", "")
+        if not isinstance(keys, str):
+            return {"error": "key combo must be a string"}
+        combo = _canon_key_combo(keys)
+        for blocked in _BLOCKED_KEY_COMBOS:
+            if blocked.issubset(combo) and len(blocked) <= len(combo):
+                return {
+                    "error": f"blocked key combo: {sorted(blocked)}",
+                    "hint": "Destructive system shortcuts are hard-blocked.",
+                }
+
+    if args.get("bring_to_front") and args.get("delivery_mode") != "foreground":
+        return {
+            "error": "bring_to_front requires delivery_mode='foreground'",
+            "code": "bring_to_front_requires_foreground",
+        }
+    return None
+
+
+def _batch_failure(
+    failed_step: int,
+    reason: str,
+    *,
+    result: Any = None,
+    completed_steps: int = 0,
+) -> str:
+    payload: Dict[str, Any] = {
+        "ok": False,
+        "action": "batch",
+        "status": "escalation_required",
+        "failed_step": failed_step,
+        "completed_steps": completed_steps,
+        "reason": reason,
+    }
+    if result is not None:
+        payload["result"] = result
+    return json.dumps(payload)
+
+
+def _parse_batch_result(raw: Any) -> Any:
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return {"error": "computer_use returned a non-JSON batch result"}
+    if isinstance(raw, dict):
+        # Per-step capture_after is rejected, so a multimodal response here is
+        # unexpected and must return control to the parent.
+        if raw.get("_multimodal"):
+            return {"error": "multimodal result is not supported inside batch"}
+        return raw
+    return raw
+
+
+def _batch_result_is_uncertain(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if result.get("error") or result.get("ok") is False:
+        return True
+    if result.get("verified") is False or result.get("degraded") is True:
+        return True
+    if result.get("effect") in {"suspected_noop", "unverifiable"}:
+        return True
+    if result.get("escalation") or result.get("code"):
+        return True
+    return False
+
+
+def _handle_batch(args: Dict[str, Any], **kwargs) -> Any:
+    steps = args.get("steps")
+    if not isinstance(steps, list) or not (1 <= len(steps) <= _MAX_BATCH_STEPS):
+        return _batch_failure(
+            -1,
+            f"steps must be a list with 1..{_MAX_BATCH_STEPS} items",
+        )
+
+    normalized: List[Dict[str, Any]] = []
+    # Validate the complete plan before the first click. A forbidden later
+    # step must never leave a half-executed workflow behind.
+    for index, raw_step in enumerate(steps):
+        if not isinstance(raw_step, dict):
+            return _batch_failure(index, "each step must be an object")
+        step = dict(raw_step)
+        action = str(step.get("action") or "").strip().lower()
+        step["action"] = action
+        if action not in _BATCH_ALLOWED_ACTIONS:
+            return _batch_failure(index, f"action {action!r} is outside the low-risk batch surface")
+        if step.get("capture_after"):
+            return _batch_failure(index, "capture_after is allowed only on the outer batch")
+        validation_error = _action_validation_error(action, step)
+        if validation_error is not None:
+            return _batch_failure(index, "step validation failed", result=validation_error)
+        normalized.append(step)
+
+    results: List[Any] = []
+    for index, step in enumerate(normalized):
+        result = _parse_batch_result(handle_computer_use(step, **kwargs))
+        if _batch_result_is_uncertain(result):
+            return _batch_failure(
+                index,
+                "step failed or returned an uncertain driver verdict",
+                result=result,
+                completed_steps=index,
+            )
+        results.append(result)
+
+    completed: Dict[str, Any] = {
+        "ok": True,
+        "action": "batch",
+        "status": "completed",
+        "completed_steps": len(results),
+        "results": results,
+    }
+    if not args.get("capture_after"):
+        return json.dumps(completed)
+
+    session_id = str(kwargs.get("session_id") or "")
+    try:
+        backend = _get_backend(session_id=session_id)
+        with _backend_lock:
+            call_lock = _backend_call_locks.setdefault(session_id, threading.RLock())
+        with call_lock:
+            return _maybe_follow_capture(
+                backend,
+                ActionResult(
+                    ok=True,
+                    action="batch",
+                    message=f"completed {len(results)} deterministic steps",
+                    meta={"completed_steps": len(results), "results": results},
+                ),
+                True,
+            )
+    except Exception as exc:
+        completed["verification_warning"] = f"final capture failed: {exc}"
+        return json.dumps(completed)
+
+
 def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     """Main entry point — dispatched by tools.registry.
 
@@ -550,37 +716,15 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     (image + summary) which run_agent.py wraps into the tool message.
     """
     action = (args.get("action") or "").strip().lower()
-    if not action:
-        return json.dumps({"error": "missing `action`"})
+    validation_error = _action_validation_error(action, args)
+    if validation_error is not None:
+        return json.dumps(validation_error)
     # Per-run key for approval-state and daemon-mode isolation across
     # concurrent sessions.
     session_id = str(kwargs.get("session_id") or "")
 
-    # Safety: validate actions before approval prompt.
-    if action in {"type", "cua_browser_type"}:
-        text = args.get("text", "")
-        pat = _is_blocked_type(text)
-        if pat:
-            return json.dumps({
-                "error": f"blocked pattern in type text: {pat!r}",
-                "hint": "Dangerous shell patterns cannot be typed via computer_use.",
-            })
-
-    if action == "key":
-        keys = args.get("keys", "")
-        combo = _canon_key_combo(keys)
-        for blocked in _BLOCKED_KEY_COMBOS:
-            if blocked.issubset(combo) and len(blocked) <= len(combo):
-                return json.dumps({
-                    "error": f"blocked key combo: {sorted(blocked)}",
-                    "hint": "Destructive system shortcuts are hard-blocked.",
-                })
-
-    if args.get("bring_to_front") and args.get("delivery_mode") != "foreground":
-        return json.dumps({
-            "error": "bring_to_front requires delivery_mode='foreground'",
-            "code": "bring_to_front_requires_foreground",
-        })
+    if action == "batch":
+        return _handle_batch(args, **kwargs)
 
     # Approval gate (destructive actions only). A durable config grant is
     # already the user's authorization, so it stands in for the prompt.
