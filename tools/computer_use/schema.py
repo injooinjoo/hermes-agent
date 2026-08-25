@@ -36,6 +36,7 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
             "action": {
                 "type": "string",
                 "enum": [
+                    "batch",
                     "capture",
                     "click",
                     "double_click",
@@ -61,12 +62,32 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "cua_browser_download",
                 ],
                 "description": (
-                    "Which action to perform. `capture` is free (no side "
+                    "Which action to perform. `batch` runs up to 12 preplanned "
+                    "low-risk steps deterministically, without another model "
+                    "round-trip per click, and stops on the first failure or "
+                    "uncertain driver verdict. `capture` is free (no side "
                     "effects). All other actions require approval unless "
                     "auto-approved. Use `set_value` for select/popup elements "
                     "and sliders — it selects the matching option directly "
                     "without opening the native menu (no focus steal)."
                 ),
+            },
+            "steps": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 12,
+                "description": (
+                    "For action='batch': ordered low-risk computer_use calls. "
+                    "Nested batches, browser setup/dialogs, uploads and downloads "
+                    "are rejected before any step runs. Each mutating step keeps "
+                    "its normal approval gate."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {"action": {"type": "string"}},
+                    "required": ["action"],
+                    "additionalProperties": True,
+                },
             },
             # ── capture ────────────────────────────────────────────
             "mode": {
